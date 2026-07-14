@@ -1,0 +1,245 @@
+{
+  "name": "Enterprise Invoice Automation Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "YOUR_INVOICE_FOLDER_ID",
+          "mode": "list"
+        },
+        "event": "fileCreated",
+        "options": {}
+      },
+      "id": "c55c35a9-f2e2-464d-86c3-7d52930dec01",
+      "name": "Watch Invoice Folder",
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        1088,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "58c7d0b6-88f5-4d2b-a084-1bad1bf79b05",
+      "name": "Download Invoice File",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1312,
+        592
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a base64 data URI so the file can be sent to OpenAI's vision endpoint.\n// Supports image invoices (jpg/png) directly. PDFs are also base64-encoded here;\n// gpt-4o accepts PDF via the file/document input in newer API versions, but if your\n// n8n OpenAI node version only supports image_url, convert PDFs to an image upstream\n// (e.g. with a 'Extract from File' + rendering step, or a PDF-to-image API).\nconst binary = $input.first().binary;\nconst binaryKey = Object.keys(binary)[0];\nconst fileData = binary[binaryKey];\n\nconst mimeType = fileData.mimeType || 'application/pdf';\nconst base64 = fileData.data;\n\nreturn [{\n  json: {\n    fileName: fileData.fileName || 'invoice',\n    mimeType,\n    dataUri: `data:${mimeType};base64,${base64}`\n  }\n}];"
+      },
+      "id": "f0b05c47-5147-4255-b184-999e4faa91f5",
+      "name": "Prepare Base64 for Vision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1536,
+        592
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "31cdbba9-c61b-42df-b63c-83cab0573c87",
+      "name": "Extract Invoice Fields (OpenAI)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        1760,
+        592
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 8000,
+      "credentials": {},
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and normalize the OpenAI JSON output before it hits Sheets/Gmail.\nconst raw = $json.message?.content ?? $json.content ?? $json.text ?? '{}';\n\nlet parsed;\ntry {\n  parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;\n} catch (e) {\n  throw new Error(`Invoice parsing failed: could not read structured data from document. Raw AI output: ${JSON.stringify(raw).slice(0, 300)}`);\n}\n\nconst required = ['creditor', 'debtor', 'amount', 'date'];\nconst missing = required.filter(k => !parsed[k]);\nif (missing.length) {\n  throw new Error(`Invoice parsing incomplete: missing field(s) ${missing.join(', ')}. This document may be unreadable or non-standard.`);\n}\n\nreturn [{\n  json: {\n    creditor: String(parsed.creditor).trim(),\n    debtor: String(parsed.debtor).trim(),\n    amount: String(parsed.amount).trim(),\n    date: String(parsed.date).trim()\n  }\n}];"
+      },
+      "id": "a8552916-cbc0-4959-9a90-b40f5b51dc68",
+      "name": "Validate Extracted Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1968,
+        592
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Accounts Payable/Receivable",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date": "={{ $json.date }}",
+            "Creditor": "={{ $json.creditor }}",
+            "Debtor": "={{ $json.debtor }}",
+            "Amount": "={{ $json.amount }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "86144447-67f7-4657-980f-4e80da09fc09",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2192,
+        592
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "sendTo": "finance-team@yourcompany.com",
+        "subject": "=Automated Invoice Processed: {{ $json.creditor }} - {{ $json.amount }}",
+        "message": "=<p>The automated invoice pipeline has successfully processed a new invoice without manual intervention.</p><ul><li><strong>Creditor:</strong> {{ $json.creditor }}</li><li><strong>Debtor:</strong> {{ $json.debtor }}</li><li><strong>Total Amount:</strong> {{ $json.amount }}</li><li><strong>Invoice Date:</strong> {{ $json.date }}</li></ul><p>This entry has been logged to the Accounts Payable/Receivable sheet.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "0bc0da7a-3be5-48cb-a64e-76ace3b62488",
+      "name": "Notify Finance Team",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2416,
+        592
+      ],
+      "webhookId": "4aef9e33-9baf-45b3-b07c-8f38aef45b21"
+    },
+    {
+      "parameters": {
+        "sendTo": "admin@yourcompany.com",
+        "subject": "=⚠ Invoice Pipeline Error: Unreadable Document",
+        "message": "=<p>The Enterprise Invoice Automation Pipeline failed to process an uploaded document.</p><p><strong>Error:</strong> {{ $json.error?.message || $json.message || 'Unknown error during extraction.' }}</p><p>Please check the Google Drive folder and re-upload a clearer scan or verify the file format (PDF/JPG/PNG).</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "b8c9a6b0-2b42-4c03-91a1-2cc01713c10c",
+      "name": "Alert Admin (Unreadable Doc)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1968,
+        832
+      ],
+      "webhookId": "8a8683d4-c54a-4dc4-9f57-f477572dfb48"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Watch Invoice Folder": {
+      "main": [
+        [
+          {
+            "node": "Download Invoice File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Invoice File": {
+      "main": [
+        [
+          {
+            "node": "Prepare Base64 for Vision",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Admin (Unreadable Doc)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Extracted Data": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Admin (Unreadable Doc)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Notify Finance Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "f988d45d-ca4d-40ed-9465-4c1a8c726144",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "b2a1cc7e0ab9288e8245cdb6395a66eb87db78c44a448f82e5d3e6ba6cd094cd"
+  },
+  "nodeGroups": [],
+  "id": "xv0NeAOZMQ5rvtcS",
+  "tags": []
+}
