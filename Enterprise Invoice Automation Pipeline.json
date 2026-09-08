@@ -1,5 +1,5 @@
 {
-  "name": "Enterprise Invoice Automation Pipeline",
+  "name": "Invoice Extraction Automation",
   "nodes": [
     {
       "parameters": {
@@ -13,19 +13,19 @@
         "triggerOn": "specificFolder",
         "folderToWatch": {
           "__rl": true,
-          "value": "YOUR_INVOICE_FOLDER_ID",
-          "mode": "list"
+          "value": "={{ $env.GOOGLE_DRIVE_FOLDER_ID }}",
+          "mode": "id"
         },
         "event": "fileCreated",
         "options": {}
       },
-      "id": "c55c35a9-f2e2-464d-86c3-7d52930dec01",
-      "name": "Watch Invoice Folder",
+      "id": "da1fed83-1205-4529-a990-cd1c4ec1c62d",
+      "name": "Google Drive Trigger",
       "type": "n8n-nodes-base.googleDriveTrigger",
       "typeVersion": 1,
       "position": [
-        1088,
-        592
+        560,
+        192
       ]
     },
     {
@@ -33,144 +33,225 @@
         "operation": "download",
         "fileId": {
           "__rl": true,
-          "value": "={{ $json.id }}",
-          "mode": "id"
+          "mode": "id",
+          "value": "={{ $json.id }}"
         },
         "options": {}
       },
-      "id": "58c7d0b6-88f5-4d2b-a084-1bad1bf79b05",
+      "id": "5f6694e4-4e18-4449-95f8-27817dbf43d0",
       "name": "Download Invoice File",
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "position": [
-        1312,
-        592
-      ],
-      "retryOnFail": true,
-      "maxTries": 2,
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "jsCode": "// Build a base64 data URI so the file can be sent to OpenAI's vision endpoint.\n// Supports image invoices (jpg/png) directly. PDFs are also base64-encoded here;\n// gpt-4o accepts PDF via the file/document input in newer API versions, but if your\n// n8n OpenAI node version only supports image_url, convert PDFs to an image upstream\n// (e.g. with a 'Extract from File' + rendering step, or a PDF-to-image API).\nconst binary = $input.first().binary;\nconst binaryKey = Object.keys(binary)[0];\nconst fileData = binary[binaryKey];\n\nconst mimeType = fileData.mimeType || 'application/pdf';\nconst base64 = fileData.data;\n\nreturn [{\n  json: {\n    fileName: fileData.fileName || 'invoice',\n    mimeType,\n    dataUri: `data:${mimeType};base64,${base64}`\n  }\n}];"
-      },
-      "id": "f0b05c47-5147-4255-b184-999e4faa91f5",
-      "name": "Prepare Base64 for Vision",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1536,
-        592
+        800,
+        192
       ]
     },
     {
-      "parameters": {},
-      "id": "31cdbba9-c61b-42df-b63c-83cab0573c87",
-      "name": "Extract Invoice Fields (OpenAI)",
-      "type": "n8n-nodes-base.openAi",
-      "typeVersion": 1.8,
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [ { parts: [ { text: 'You are an invoice-processing assistant. Carefully read this invoice, including any handwritten text, and extract the following fields. Respond with ONLY a valid JSON object, no markdown formatting and no explanation, using exactly these keys: vendor_name, invoice_number, invoice_date, due_date, total_amount, currency, line_items (an array of objects with description, quantity, unit_price, amount). If a field is not present on the invoice, use null for it.' }, { inline_data: { mime_type: $json.file_mime, data: $json.file_base64 } } ] } ], generationConfig: { temperature: 0, response_mime_type: 'application/json' } }) }}",
+        "options": {}
+      },
+      "id": "ab8519c4-430d-40f9-9c24-2ccc7bf23c31",
+      "name": "Extract Invoice Data (Gemini)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
       "position": [
-        1760,
-        592
-      ],
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 8000,
-      "credentials": {},
-      "onError": "continueErrorOutput"
+        1264,
+        192
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// Validate and normalize the OpenAI JSON output before it hits Sheets/Gmail.\nconst raw = $json.message?.content ?? $json.content ?? $json.text ?? '{}';\n\nlet parsed;\ntry {\n  parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;\n} catch (e) {\n  throw new Error(`Invoice parsing failed: could not read structured data from document. Raw AI output: ${JSON.stringify(raw).slice(0, 300)}`);\n}\n\nconst required = ['creditor', 'debtor', 'amount', 'date'];\nconst missing = required.filter(k => !parsed[k]);\nif (missing.length) {\n  throw new Error(`Invoice parsing incomplete: missing field(s) ${missing.join(', ')}. This document may be unreadable or non-standard.`);\n}\n\nreturn [{\n  json: {\n    creditor: String(parsed.creditor).trim(),\n    debtor: String(parsed.debtor).trim(),\n    amount: String(parsed.amount).trim(),\n    date: String(parsed.date).trim()\n  }\n}];"
+        "jsCode": "const response = $input.first().json;\n\nif (!response.candidates || !response.candidates.length) {\n  return [{\n    json: {\n      parse_error: true,\n      gemini_error: response.error || response,\n      raw_response: response\n    }\n  }];\n}\n\nlet text = response.candidates[0].content.parts[0].text;\ntext = text.trim().replace(/^```json\\n?/, '').replace(/```$/, '');\n\nlet invoice;\ntry {\n  invoice = JSON.parse(text);\n} catch (e) {\n  invoice = { parse_error: true, raw_text: text };\n}\n\nconst driveFile = $('Google Drive Trigger').first().json;\n\nconst lineItemsHtml = (invoice.line_items && invoice.line_items.length)\n  ? invoice.line_items.map(li => `\n    <tr>\n      <td style=\"padding:6px 10px;border-bottom:1px solid #eee;\">${li.description || '-'}</td>\n      <td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:center;\">${li.quantity || '-'}</td>\n      <td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:right;\">${li.unit_price || '-'}</td>\n      <td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:right;\">${li.amount || '-'}</td>\n    </tr>`).join('')\n  : `<tr><td colspan=\"4\" style=\"padding:6px 10px;color:#888;\">No line items extracted</td></tr>`;\n\nconst emailHtml = `\n<div style=\"font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#222;\">\n  <h2 style=\"color:#2c3e50;border-bottom:2px solid #eee;padding-bottom:8px;\">New Invoice Processed</h2>\n  <table style=\"width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;\">\n    <tr><td style=\"padding:4px 0;color:#888;width:140px;\">Vendor</td><td><b>${invoice.vendor_name || '-'}</b></td></tr>\n    <tr><td style=\"padding:4px 0;color:#888;\">Invoice Number</td><td>${invoice.invoice_number || '-'}</td></tr>\n    <tr><td style=\"padding:4px 0;color:#888;\">Invoice Date</td><td>${invoice.invoice_date || '-'}</td></tr>\n    <tr><td style=\"padding:4px 0;color:#888;\">Due Date</td><td>${invoice.due_date || '-'}</td></tr>\n    <tr><td style=\"padding:4px 0;color:#888;\">Total Amount</td><td><b style=\"font-size:16px;\">${invoice.total_amount || '-'} ${invoice.currency || ''}</b></td></tr>\n  </table>\n\n  <h3 style=\"color:#2c3e50;margin-bottom:4px;\">Line Items</h3>\n  <table style=\"width:100%;border-collapse:collapse;font-size:13px;\">\n    <thead>\n      <tr style=\"background:#f5f5f5;\">\n        <th style=\"text-align:left;padding:6px 10px;\">Description</th>\n        <th style=\"text-align:center;padding:6px 10px;\">Qty</th>\n        <th style=\"text-align:right;padding:6px 10px;\">Unit Price</th>\n        <th style=\"text-align:right;padding:6px 10px;\">Amount</th>\n      </tr>\n    </thead>\n    <tbody>${lineItemsHtml}</tbody>\n  </table>\n\n  <p style=\"margin-top:20px;font-size:13px;color:#555;\">\n    File: ${driveFile.name}<br>\n    <a href=\"${driveFile.webViewLink || ('https://drive.google.com/file/d/' + driveFile.id + '/view')}\" style=\"color:#3b82f6;\">View original invoice in Drive</a>\n  </p>\n</div>\n`;\n\nreturn [{\n  json: {\n    ...invoice,\n    file_name: driveFile.name,\n    file_id: driveFile.id,\n    drive_link: driveFile.webViewLink || ('https://drive.google.com/file/d/' + driveFile.id + '/view'),\n    processed_at: new Date().toISOString(),\n    email_html: emailHtml\n  }\n}];"
       },
-      "id": "a8552916-cbc0-4959-9a90-b40f5b51dc68",
-      "name": "Validate Extracted Data",
+      "id": "965a7cf4-44ee-49a8-857a-d4e236bec33f",
+      "name": "Parse AI Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1968,
-        592
-      ],
-      "onError": "continueErrorOutput"
+        1504,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $env.NOTIFICATION_EMAIL }}",
+        "subject": "=New Invoice Processed: {{$json.vendor_name}} - {{$json.total_amount}} {{$json.currency}}",
+        "message": "=={{ $json.email_html }}",
+        "options": {}
+      },
+      "id": "59235199-324a-4712-ab0f-84e9bdc74170",
+      "name": "Send Email Notification",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1744,
+        80
+      ]
     },
     {
       "parameters": {
         "operation": "append",
         "documentId": {
           "__rl": true,
-          "value": "YOUR_GOOGLE_SHEET_ID",
+          "value": "={{ $env.GOOGLE_SHEET_ID }}",
           "mode": "list"
         },
         "sheetName": {
           "__rl": true,
-          "value": "Accounts Payable/Receivable",
-          "mode": "list"
+          "value": "Sheet1",
+          "mode": "name"
         },
         "columns": {
           "mappingMode": "defineBelow",
           "value": {
-            "Date": "={{ $json.date }}",
-            "Creditor": "={{ $json.creditor }}",
-            "Debtor": "={{ $json.debtor }}",
-            "Amount": "={{ $json.amount }}"
-          }
+            "Processed At": "={{$json.processed_at}}",
+            "Vendor": "={{$json.vendor_name}}",
+            "Invoice Number": "={{ $json.invoice_number }}",
+            "Invoice Date": "={{ $json.invoice_date }}",
+            "Due Date": "={{ $json.due_date }}",
+            "Total Amount": "={{ $json.total_amount }}",
+            " Currency": "={{ $json.currency }}",
+            "File Name": "={{ $json.file_name }}",
+            "Drive Link": "={{ $json.drive_link }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Processed At",
+              "displayName": "Processed At",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Vendor",
+              "displayName": "Vendor",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Invoice Number",
+              "displayName": "Invoice Number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Invoice Date",
+              "displayName": "Invoice Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Due Date",
+              "displayName": "Due Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Total Amount",
+              "displayName": "Total Amount",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": " Currency",
+              "displayName": " Currency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "File Name",
+              "displayName": "File Name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Drive Link",
+              "displayName": "Drive Link",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
         },
         "options": {}
       },
-      "id": "86144447-67f7-4657-980f-4e80da09fc09",
-      "name": "Log to Google Sheets",
+      "id": "b97be3b5-b7d4-4ff9-8f5c-ccf854b6366d",
+      "name": "Append to Google Sheet",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.5,
       "position": [
-        2192,
-        592
-      ],
-      "retryOnFail": true,
-      "maxTries": 2,
-      "onError": "continueErrorOutput"
+        1744,
+        320
+      ]
     },
     {
       "parameters": {
-        "sendTo": "finance-team@yourcompany.com",
-        "subject": "=Automated Invoice Processed: {{ $json.creditor }} - {{ $json.amount }}",
-        "message": "=<p>The automated invoice pipeline has successfully processed a new invoice without manual intervention.</p><ul><li><strong>Creditor:</strong> {{ $json.creditor }}</li><li><strong>Debtor:</strong> {{ $json.debtor }}</li><li><strong>Total Amount:</strong> {{ $json.amount }}</li><li><strong>Invoice Date:</strong> {{ $json.date }}</li></ul><p>This entry has been logged to the Accounts Payable/Receivable sheet.</p>",
-        "options": {
-          "appendAttribution": false
-        }
+        "jsCode": "const item = $input.first();\nconst buffer = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst base64 = buffer.toString('base64');\n\nreturn [{\n  json: {\n    file_base64: base64,\n    file_mime: item.binary.data.mimeType\n  }\n}];"
       },
-      "id": "0bc0da7a-3be5-48cb-a64e-76ace3b62488",
-      "name": "Notify Finance Team",
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2.1,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        2416,
-        592
+        1024,
+        192
       ],
-      "webhookId": "4aef9e33-9baf-45b3-b07c-8f38aef45b21"
-    },
-    {
-      "parameters": {
-        "sendTo": "admin@yourcompany.com",
-        "subject": "=⚠ Invoice Pipeline Error: Unreadable Document",
-        "message": "=<p>The Enterprise Invoice Automation Pipeline failed to process an uploaded document.</p><p><strong>Error:</strong> {{ $json.error?.message || $json.message || 'Unknown error during extraction.' }}</p><p>Please check the Google Drive folder and re-upload a clearer scan or verify the file format (PDF/JPG/PNG).</p>",
-        "options": {
-          "appendAttribution": false
-        }
-      },
-      "id": "b8c9a6b0-2b42-4c03-91a1-2cc01713c10c",
-      "name": "Alert Admin (Unreadable Doc)",
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2.1,
-      "position": [
-        1968,
-        832
-      ],
-      "webhookId": "8a8683d4-c54a-4dc4-9f57-f477572dfb48"
+      "id": "d86ea97c-b769-491c-bb83-b539a724e66c",
+      "name": "Code in JavaScript"
     }
   ],
-  "pinData": {},
   "connections": {
-    "Watch Invoice Folder": {
+    "Google Drive Trigger": {
       "main": [
         [
           {
@@ -185,43 +266,45 @@
       "main": [
         [
           {
-            "node": "Prepare Base64 for Vision",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Alert Admin (Unreadable Doc)",
+            "node": "Code in JavaScript",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Validate Extracted Data": {
+    "Extract Invoice Data (Gemini)": {
       "main": [
         [
           {
-            "node": "Log to Google Sheets",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Alert Admin (Unreadable Doc)",
+            "node": "Parse AI Response",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Log to Google Sheets": {
+    "Parse AI Response": {
       "main": [
         [
           {
-            "node": "Notify Finance Team",
+            "node": "Send Email Notification",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Append to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Extract Invoice Data (Gemini)",
             "type": "main",
             "index": 0
           }
@@ -229,17 +312,10 @@
       ]
     }
   },
-  "active": false,
   "settings": {
     "executionOrder": "v1",
     "binaryMode": "separate"
   },
-  "versionId": "f988d45d-ca4d-40ed-9465-4c1a8c726144",
-  "meta": {
-    "templateCredsSetupCompleted": true,
-    "instanceId": "b2a1cc7e0ab9288e8245cdb6395a66eb87db78c44a448f82e5d3e6ba6cd094cd"
-  },
   "nodeGroups": [],
-  "id": "xv0NeAOZMQ5rvtcS",
   "tags": []
 }
